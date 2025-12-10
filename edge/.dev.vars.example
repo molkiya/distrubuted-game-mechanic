@@ -1,0 +1,15 @@
+# Example development environment variables
+# Copy this to .dev.vars and adjust values
+
+# Backend regions configuration (JSON array)
+BACKEND_REGIONS_JSON='[{"id":"eu","baseUrl":"http://localhost:8081"},{"id":"us","baseUrl":"http://localhost:8082"},{"id":"asia","baseUrl":"http://localhost:8083"}]'
+
+# Default region to use when no preference is provided
+DEFAULT_REGION="eu"
+
+# Backend request timeout in milliseconds
+BACKEND_TIMEOUT_MS="5000"
+
+# Cache TTL in milliseconds (30 seconds)
+CACHE_TTL_MS="30000"
+

@@ -1,0 +1,26 @@
+# Cloudflare Workers configuration
+# See: https://developers.cloudflare.com/workers/wrangler/configuration/
+
+name = "game-edge-gateway"
+main = "src/index.ts"
+compatibility_date = "2024-01-15"
+
+# Environment variables (set via wrangler secret put or in Cloudflare dashboard)
+# Example:
+# BACKEND_REGIONS_JSON = '[{"id":"eu","baseUrl":"https://eu.api.example.com"},{"id":"us","baseUrl":"https://us.api.example.com"}]'
+# DEFAULT_REGION = "eu"
+# BACKEND_TIMEOUT_MS = "5000"
+# CACHE_TTL_MS = "30000"
+
+[env.production]
+# Production environment settings
+
+[env.development]
+# Development environment settings
+
+# For local development, you can also use .dev.vars file:
+# BACKEND_REGIONS_JSON='[{"id":"eu","baseUrl":"http://localhost:8081"},{"id":"us","baseUrl":"http://localhost:8082"}]'
+# DEFAULT_REGION="eu"
+# BACKEND_TIMEOUT_MS="5000"
+# CACHE_TTL_MS="30000"
+

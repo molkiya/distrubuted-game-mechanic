@@ -1,0 +1,297 @@
+openapi: 3.0.3
+info:
+  title: Deterministic Real-Time Session API
+  description: |
+    HTTP API for managing deterministic real-time sessions.
+    
+    The service provides session management endpoints and enables clients
+    to independently compute synchronized game states using seed-based
+    deterministic algorithms.
+  version: 1.0.0
+  contact:
+    name: API Support
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+  - url: https://api.example.com
+    description: Production server
+
+paths:
+  /v1/sessions:
+    post:
+      summary: Create a new session
+      description: |
+        Creates a new deterministic real-time session.
+        Returns session configuration including seed, start time, and tick interval.
+      operationId: createSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionCreateRequest'
+      responses:
+        '201':
+          description: Session created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/sessions/{id}:
+    get:
+      summary: Get session configuration
+      description: |
+        Retrieves the configuration for a session.
+        Returns seed, start time, tick interval, and metadata.
+      operationId: getSession
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Session ID
+          schema:
+            type: string
+            example: sess_abc-123-def
+      responses:
+        '200':
+          description: Session found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/sessions/{id}/stop:
+    post:
+      summary: Stop a session
+      description: |
+        Marks a session as stopped.
+        The session can no longer be used for state computation.
+      operationId: stopSession
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Session ID
+          schema:
+            type: string
+            example: sess_abc-123-def
+      responses:
+        '200':
+          description: Session stopped successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StopSessionResponse'
+        '400':
+          description: Invalid request (e.g., session already stopped)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/sessions/{id}/state:
+    get:
+      summary: Get current session state
+      description: |
+        Computes and returns the current deterministic state for a session.
+        This endpoint uses the deterministic engine to compute state from
+        the session's seed, start time, and current time.
+      operationId: getSessionState
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Session ID
+          schema:
+            type: string
+            example: sess_abc-123-def
+      responses:
+        '200':
+          description: Current state computed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionStateResponse'
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /healthz:
+    get:
+      summary: Health check
+      description: Returns the health status of the service
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+components:
+  schemas:
+    SessionCreateRequest:
+      type: object
+      required:
+        - tick_ms
+      properties:
+        tick_ms:
+          type: integer
+          description: Tick interval in milliseconds
+          minimum: 1
+          example: 100
+        start_at:
+          type: string
+          format: date-time
+          description: |
+            Optional start time in RFC3339 format.
+            If not provided, defaults to now + 3 seconds.
+          example: "2024-01-15T10:30:03Z"
+        metadata:
+          type: object
+          description: Optional arbitrary JSON metadata
+          additionalProperties: true
+          example:
+            game_type: counter
+            difficulty: medium
+
+    SessionResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Session ID (format: sess_xxx)
+          example: sess_abc-123-def
+        seed:
+          type: string
+          description: Seed value (UUID or uint64 as string) for deterministic computation
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        start_at:
+          type: string
+          format: date-time
+          description: Session start time in RFC3339 format
+          example: "2024-01-15T10:30:03Z"
+        tick_ms:
+          type: integer
+          description: Tick interval in milliseconds
+          example: 100
+        metadata:
+          type: object
+          description: Session metadata (arbitrary JSON)
+          additionalProperties: true
+          example:
+            game_type: counter
+        status:
+          type: string
+          enum: [running, stopped]
+          description: Session status
+          example: running
+
+    SessionStateResponse:
+      type: object
+      description: |
+        Current deterministic state computed from session parameters.
+        This state is computed using engine.StateAt(seed, startAt, tickMs, now).
+      properties:
+        step:
+          type: integer
+          format: int64
+          description: Number of ticks since start (0-based)
+          example: 42
+        value:
+          type: integer
+          format: int64
+          description: Current counter value (resets on break)
+          example: 15
+        round:
+          type: integer
+          format: int64
+          description: Round number (increments after each break)
+          example: 1
+        broken:
+          type: boolean
+          description: Whether the sequence just broke (reset)
+          example: false
+        computed_at:
+          type: string
+          format: date-time
+          description: Time when state was computed (RFC3339)
+          example: "2024-01-15T10:30:45Z"
+
+    StopSessionResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Session ID
+          example: sess_abc-123-def
+        status:
+          type: string
+          enum: [stopped]
+          description: Session status (always "stopped" after this call)
+          example: stopped
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error type or code
+          example: invalid_request
+        message:
+          type: string
+          description: Detailed error message
+          example: tick_ms must be greater than 0
+
