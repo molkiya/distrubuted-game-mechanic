@@ -1,5 +1,7 @@
 # Deterministic Real-Time Session Service
 
+> [🇷🇺 Русская версия](README.ru.md)
+
 A production-ready Go HTTP API service that provides deterministic real-time session management. The service enables clients to independently compute synchronized game states using seed-based deterministic algorithms, eliminating the need for continuous backend communication.
 
 ## Overview

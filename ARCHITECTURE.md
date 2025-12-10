@@ -1,5 +1,7 @@
 # Distributed Game System Architecture
 
+> [🇷🇺 Русская версия](ARCHITECTURE.ru.md)
+
 ## Title & Summary
 
 A **multi-region, edge-optimized game backend** that enables synchronized deterministic gameplay across global players using seed-based pseudo-random algorithms. The system consists of a React frontend, a Cloudflare Workers edge gateway for intelligent routing, stateless Go backend services deployed across multiple regions (EU, US, Asia), and Apache Cassandra as the shared distributed storage layer. The core innovation is **client-side deterministic execution**: instead of streaming every game tick from the backend, the system distributes a seed and synchronized start time, allowing clients to independently compute identical game states while reducing backend load by orders of magnitude.

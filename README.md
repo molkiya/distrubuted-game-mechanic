@@ -1,5 +1,7 @@
 # Distributed Game Backend
 
+> [🇷🇺 Русская версия](README.ru.md)
+
 A production-style Go backend for a geographically distributed game system with a main server and regional instances, using **Apache Cassandra** for highly scalable, distributed session storage.
 
 ## Architecture

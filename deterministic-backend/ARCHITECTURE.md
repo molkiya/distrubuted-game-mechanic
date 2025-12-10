@@ -1,5 +1,7 @@
 # Architecture Documentation
 
+> [🇷🇺 Русская версия](ARCHITECTURE.ru.md)
+
 ## Overview
 
 This service implements a **deterministic real-time session engine** that enables clients to independently compute synchronized game states without continuous backend communication.
