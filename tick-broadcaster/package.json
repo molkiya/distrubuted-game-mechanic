@@ -1,0 +1,30 @@
+{
+  "name": "tick-broadcaster",
+  "version": "1.0.0",
+  "description": "AWS Lambda microbackend for broadcasting game ticks to geographically close players",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "deploy": "serverless deploy",
+    "deploy:eu": "serverless deploy --stage prod --region eu-west-1",
+    "deploy:us": "serverless deploy --stage prod --region us-east-1",
+    "deploy:asia": "serverless deploy --stage prod --region ap-northeast-1",
+    "deploy:all": "npm run deploy:eu && npm run deploy:us && npm run deploy:asia",
+    "local": "serverless offline"
+  },
+  "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.490.0",
+    "@aws-sdk/client-dynamodb": "^3.490.0",
+    "@aws-sdk/lib-dynamodb": "^3.490.0",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.131",
+    "@types/node": "^20.10.0",
+    "@types/uuid": "^9.0.7",
+    "serverless": "^3.38.0",
+    "serverless-offline": "^13.3.0",
+    "typescript": "^5.3.0"
+  }
+}
+

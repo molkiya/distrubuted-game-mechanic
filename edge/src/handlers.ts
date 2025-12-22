@@ -2,13 +2,10 @@
  * Request Handlers for Edge Gateway
  * 
  * These handlers implement the edge layer's public API:
- * - POST /edge/game/start
- * - POST /edge/game/exit
+ * - POST /edge/game/start - Creates game session via tick-broadcaster
+ * - POST /edge/game/exit - Exits game session
  * 
- * The edge layer acts as:
- * 1. A smart router that selects the best backend region
- * 2. A caching layer to reduce backend load
- * 3. A foundation for future "microprocess" features (edge-hosted game state)
+ * The edge layer now routes to tick-broadcaster Lambda for real-time tick streaming.
  */
 
 import {
@@ -17,20 +14,22 @@ import {
   EdgeStartGameResponse,
   EdgeExitGameResponse,
   EdgeConfig,
+  TickBroadcasterCreateSessionResponse,
 } from './types';
 import { RegionSelectionStrategy } from './region-selector';
 import { GameSessionCache } from './cache';
 import { callBackendStartGame, callBackendExitGame } from './backend-client';
+import { mapToAWSRegion, getLatencyThresholds } from './config';
 
 /**
  * Handles POST /edge/game/start
  * 
  * Flow:
  * 1. Parse and validate request
- * 2. Select appropriate backend region
- * 3. Call backend /game/start
+ * 2. Select appropriate tick-broadcaster region
+ * 3. Call tick-broadcaster to create session
  * 4. Cache the response
- * 5. Return response with backendRegion info
+ * 5. Return response with WebSocket endpoint
  */
 export async function handleStartGame(
   request: Request,
@@ -50,48 +49,52 @@ export async function handleStartGame(
       );
     }
 
-    // Select backend region
-    const selectedRegion = regionSelector.selectRegion(
-      {
-        preferredRegion: body.preferredRegion,
-        headers: request.headers,
-        cf: (request as any).cf, // Cloudflare request context
-      },
-      config
+    // Map preferred region to AWS region
+    const preferredAWSRegion = body.preferredRegion 
+      ? mapToAWSRegion(body.preferredRegion) 
+      : undefined;
+
+    // Select tick-broadcaster region
+    const selectedRegion = selectTickBroadcasterRegion(
+      request,
+      config,
+      preferredAWSRegion
     );
 
-    console.log(`[EDGE] Starting game for user ${body.userId}, routing to region ${selectedRegion.id}`);
+    console.log(`[EDGE] Starting game for user ${body.userId}, routing to tick-broadcaster ${selectedRegion.id}`);
 
-    // Call backend
-    const backendResponse = await callBackendStartGame(
-      selectedRegion,
+    // Call tick-broadcaster to create session
+    const tickResponse = await createTickBroadcasterSession(
+      selectedRegion.httpEndpoint,
       body,
       config.backendTimeout
     );
 
     // Cache the session for future reference
-    // This enables:
-    // - Reducing backend load on subsequent requests
-    // - Future "microprocess" features where edge manages game state
     cache.set({
-      gameId: backendResponse.gameId,
-      seed: backendResponse.seed,
-      startAt: backendResponse.startAt,
-      tickMs: backendResponse.tickMs,
+      gameId: tickResponse.sessionId,
+      seed: tickResponse.seed,
+      startAt: tickResponse.startAt,
+      tickMs: tickResponse.tickMs,
       backendRegion: selectedRegion.id,
       cachedAt: Date.now(),
+      wsEndpoint: tickResponse.wsEndpoint,
+      httpEndpoint: tickResponse.httpEndpoint,
     });
 
-    // Return response with backend region info
+    // Return response with WebSocket endpoint
     const edgeResponse: EdgeStartGameResponse = {
-      gameId: backendResponse.gameId,
-      seed: backendResponse.seed,
-      startAt: backendResponse.startAt,
-      tickMs: backendResponse.tickMs,
+      gameId: tickResponse.sessionId,
+      seed: tickResponse.seed,
+      startAt: tickResponse.startAt,
+      tickMs: tickResponse.tickMs,
       backendRegion: selectedRegion.id,
+      region: selectedRegion.id,
+      wsEndpoint: tickResponse.wsEndpoint,
+      httpEndpoint: tickResponse.httpEndpoint,
     };
 
-    console.log(`[EDGE] Game started: ${backendResponse.gameId} in region ${selectedRegion.id}`);
+    console.log(`[EDGE] Game started: ${tickResponse.sessionId} in region ${selectedRegion.id}`);
 
     return jsonResponse(edgeResponse, 201);
   } catch (error) {
@@ -107,14 +110,111 @@ export async function handleStartGame(
 }
 
 /**
+ * Select the best tick-broadcaster region based on request context
+ */
+function selectTickBroadcasterRegion(
+  request: Request,
+  config: EdgeConfig,
+  preferredRegion?: string
+) {
+  // 1. Use preferred region if valid
+  if (preferredRegion) {
+    const region = config.tickBroadcasterRegions.find(r => r.id === preferredRegion);
+    if (region) {
+      return region;
+    }
+  }
+
+  // 2. Use x-user-region header if provided
+  const headerRegion = request.headers.get('x-user-region');
+  if (headerRegion) {
+    const awsRegion = mapToAWSRegion(headerRegion);
+    const region = config.tickBroadcasterRegions.find(r => r.id === awsRegion);
+    if (region) {
+      return region;
+    }
+  }
+
+  // 3. Use Cloudflare country code for geo-routing
+  const cf = (request as any).cf;
+  if (cf?.country) {
+    const region = getRegionFromCountry(cf.country, config);
+    if (region) {
+      return region;
+    }
+  }
+
+  // 4. Default to configured default region
+  const defaultRegion = config.tickBroadcasterRegions.find(
+    r => r.id === config.defaultRegion
+  );
+  if (defaultRegion) {
+    return defaultRegion;
+  }
+
+  // 5. Fallback to first available region
+  return config.tickBroadcasterRegions[0];
+}
+
+/**
+ * Map country code to AWS region
+ */
+function getRegionFromCountry(country: string, config: EdgeConfig) {
+  // Americas
+  const americasCountries = ['US', 'CA', 'MX', 'BR', 'AR', 'CL', 'CO', 'PE'];
+  if (americasCountries.includes(country)) {
+    return config.tickBroadcasterRegions.find(r => r.id === 'us-east-1');
+  }
+
+  // Asia Pacific
+  const asiaCountries = ['JP', 'KR', 'CN', 'TW', 'HK', 'SG', 'TH', 'VN', 'ID', 'MY', 'PH', 'AU', 'NZ', 'IN'];
+  if (asiaCountries.includes(country)) {
+    return config.tickBroadcasterRegions.find(r => r.id === 'ap-northeast-1');
+  }
+
+  // Europe and others -> EU
+  return config.tickBroadcasterRegions.find(r => r.id === 'eu-west-1');
+}
+
+/**
+ * Call tick-broadcaster to create a session
+ */
+async function createTickBroadcasterSession(
+  httpEndpoint: string,
+  request: StartGameRequest,
+  timeout: number
+): Promise<TickBroadcasterCreateSessionResponse> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(`${httpEndpoint}/sessions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`Tick-broadcaster error: ${response.status} - ${error}`);
+    }
+
+    return response.json();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
  * Handles POST /edge/game/exit
  * 
  * Flow:
  * 1. Parse and validate request
- * 2. Determine backend region (from request or cache lookup)
- * 3. Call backend /game/exit
- * 4. Clear cache entry
- * 5. Return response
+ * 2. Clear cache entry
+ * 3. Return success (session will timeout on tick-broadcaster)
  */
 export async function handleExitGame(
   request: Request,
@@ -133,48 +233,13 @@ export async function handleExitGame(
       );
     }
 
-    // Determine backend region
-    let backendRegion: { id: string; baseUrl: string } | null = null;
-
-    // 1. Check if backendRegion is provided in request
-    if (body.backendRegion) {
-      backendRegion = config.backendRegions.find((r) => r.id === body.backendRegion) || null;
-      if (!backendRegion) {
-        return jsonResponse(
-          { error: `Invalid backendRegion: ${body.backendRegion}` },
-          400
-        );
-      }
-    } else {
-      // 2. Try to find in cache
-      const cached = cache.get(body.gameId);
-      if (cached) {
-        backendRegion = config.backendRegions.find((r) => r.id === cached.backendRegion) || null;
-        console.log(`[EDGE] Found game ${body.gameId} in cache, region: ${cached.backendRegion}`);
-      }
-    }
-
-    // 3. Fallback: we need backendRegion to route the request
-    if (!backendRegion) {
-      // In a production system, you might:
-      // - Query a central registry
-      // - Try all regions (expensive)
-      // - Return error asking client to provide backendRegion
-      return jsonResponse(
-        {
-          error: 'backendRegion is required. Please provide it or ensure the game was started through this edge service.',
-        },
-        400
-      );
-    }
-
-    console.log(`[EDGE] Exiting game ${body.gameId} in region ${backendRegion.id}`);
-
-    // Call backend
-    await callBackendExitGame(backendRegion, body, config.backendTimeout);
+    console.log(`[EDGE] Exiting game ${body.gameId}`);
 
     // Clear cache entry
     cache.delete(body.gameId);
+
+    // Note: Session will timeout on tick-broadcaster automatically
+    // In production, you might want to call tick-broadcaster to stop session
 
     console.log(`[EDGE] Game exited: ${body.gameId}`);
 
@@ -200,9 +265,9 @@ function jsonResponse(data: any, status: number): Response {
     status,
     headers: {
       'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*', // Adjust CORS as needed
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, x-user-region',
     },
   });
 }
@@ -215,9 +280,8 @@ export function handleOptions(): Response {
     status: 204,
     headers: {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, x-user-region',
     },
   });
 }
-

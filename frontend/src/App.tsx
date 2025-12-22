@@ -1,17 +1,27 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { startGame, exitGame } from './utils/api';
-import { deterministicRNG, shouldBreak } from './utils/rng';
-import { GameState } from './types';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { startGame, exitGame, findBestRegion } from './utils/api';
+import { WebSocketClient, WebSocketClientCallbacks } from './utils/websocket';
+import { 
+  GameState, 
+  LatencyState, 
+  ConnectionState,
+  TickMessage,
+  CountdownMessage,
+  SessionJoinedMessage,
+  KickedMessage,
+  ErrorMessage,
+  LATENCY_THRESHOLDS,
+} from './types';
 import './App.css';
 
 /**
  * Main App Component
  * 
- * Implements a deterministic game counter that:
- * - Starts at a server-specified time (startAt)
- * - Increments every tickMs milliseconds
- * - Randomly breaks (resets) based on deterministic RNG using (seed, step)
- * - Ensures same behavior across all clients given same inputs
+ * Implements a real-time game counter that:
+ * - Connects to the nearest tick-broadcaster Lambda via WebSocket
+ * - Receives tick updates from the server (not computed locally)
+ * - Monitors latency and displays warnings
+ * - Gets kicked if latency exceeds thresholds
  */
 function App() {
   // Game state
@@ -22,18 +32,104 @@ function App() {
     startAt: null,
     tickMs: null,
     counter: 0,
+    step: 0,
+    round: 0,
     isRunning: false,
     countdown: null,
+    region: null,
+    wsEndpoint: null,
+  });
+
+  // Connection state
+  const [connection, setConnection] = useState<ConnectionState>({
+    status: 'disconnected',
+  });
+
+  // Latency state
+  const [latency, setLatency] = useState<LatencyState>({
+    avgLatency: 0,
+    jitter: 0,
+    status: 'unknown',
+    samples: [],
   });
 
   // Input state
   const [userIdInput, setUserIdInput] = useState('');
+  const [selectedRegion, setSelectedRegion] = useState<string>('auto');
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
-  // Refs to manage timers and prevent memory leaks
-  const tickIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  // WebSocket client ref
+  const wsClientRef = useRef<WebSocketClient | null>(null);
+
+  /**
+   * WebSocket callbacks
+   */
+  const wsCallbacks: WebSocketClientCallbacks = {
+    onConnectionChange: useCallback((status, errorMsg) => {
+      setConnection({ status, error: errorMsg, kickReason: status === 'kicked' ? errorMsg : undefined });
+    }, []),
+
+    onTick: useCallback((tick: TickMessage) => {
+      setGameState((prev) => ({
+        ...prev,
+        counter: tick.value,
+        step: tick.step,
+        round: tick.round,
+        isRunning: true,
+        countdown: null,
+      }));
+
+      // Log breaks
+      if (tick.broken) {
+        console.log(`[TICK] BREAK at step ${tick.step}, round ${tick.round}`);
+      }
+    }, []),
+
+    onCountdown: useCallback((countdown: CountdownMessage) => {
+      setGameState((prev) => ({
+        ...prev,
+        countdown: Math.ceil(countdown.remainingMs / 1000),
+        isRunning: false,
+      }));
+    }, []),
+
+    onSessionJoined: useCallback((session: SessionJoinedMessage) => {
+      console.log('[SESSION] Joined:', session);
+      setGameState((prev) => ({
+        ...prev,
+        gameId: session.sessionId,
+        seed: session.seed,
+        startAt: session.startAt,
+        tickMs: session.tickMs,
+        region: session.region,
+      }));
+    }, []),
+
+    onLatencyUpdate: useCallback((newLatency: LatencyState) => {
+      setLatency(newLatency);
+    }, []),
+
+    onKicked: useCallback((kicked: KickedMessage) => {
+      setError(`Kicked: ${kicked.reason}`);
+      setGameState((prev) => ({
+        ...prev,
+        isRunning: false,
+      }));
+    }, []),
+
+    onError: useCallback((err: ErrorMessage) => {
+      setError(`${err.code}: ${err.message}`);
+    }, []),
+  };
+
+  // Initialize WebSocket client
+  useEffect(() => {
+    wsClientRef.current = new WebSocketClient(wsCallbacks);
+    return () => {
+      wsClientRef.current?.disconnect();
+    };
+  }, []);
 
   /**
    * Generates a random user ID
@@ -42,107 +138,6 @@ function App() {
     const randomId = `user_${Math.random().toString(36).substring(2, 11)}`;
     setUserIdInput(randomId);
   };
-
-  /**
-   * Calculates the current step index based on elapsed time
-   * 
-   * Step = floor((currentTime - startAt) / tickMs)
-   * 
-   * This step index is used with the seed to generate deterministic
-   * pseudo-random values. The same step at the same time will produce
-   * the same RNG value across all clients.
-   */
-  const getCurrentStep = (startAt: number, tickMs: number): number => {
-    const now = Date.now();
-    const elapsed = now - startAt;
-    return Math.floor(elapsed / tickMs);
-  };
-
-  /**
-   * Handles the game tick logic
-   * 
-   * Every tick:
-   * 1. Calculate current step based on elapsed time
-   * 2. Use deterministic RNG with (seed, step) to decide if counter breaks
-   * 3. Either increment counter or reset to 0
-   * 4. Log break events for debugging
-   */
-  const handleTick = () => {
-    setGameState((prev) => {
-      if (!prev.isRunning || !prev.startAt || !prev.tickMs || !prev.seed) {
-        return prev;
-      }
-
-      const step = getCurrentStep(prev.startAt, prev.tickMs);
-      const rngValue = deterministicRNG(prev.seed, step);
-
-      // Check if counter should break (1 in 50 chance, deterministically)
-      if (shouldBreak(prev.seed, step, 50)) {
-        console.log(`[BREAK] Step: ${step}, RNG: ${rngValue}, Counter reset to 0`);
-        return { ...prev, counter: 0 };
-      }
-
-      // Increment counter
-      const newCounter = prev.counter + 1;
-      if (step % 10 === 0) {
-        // Log every 10th step for debugging
-        console.log(`[TICK] Step: ${step}, RNG: ${rngValue}, Counter: ${newCounter}`);
-      }
-
-      return { ...prev, counter: newCounter };
-    });
-  };
-
-  /**
-   * Starts the countdown and game tick interval
-   */
-  useEffect(() => {
-    if (!gameState.startAt || !gameState.tickMs) {
-      return;
-    }
-
-    // Clear any existing intervals
-    if (tickIntervalRef.current) {
-      clearInterval(tickIntervalRef.current);
-    }
-    if (countdownIntervalRef.current) {
-      clearInterval(countdownIntervalRef.current);
-    }
-
-    // Countdown interval: update countdown every 100ms
-    countdownIntervalRef.current = setInterval(() => {
-      const now = Date.now();
-      const remaining = gameState.startAt! - now;
-
-      if (remaining <= 0) {
-        // Start the game
-        setGameState((prev) => ({
-          ...prev,
-          isRunning: true,
-          countdown: null,
-        }));
-        console.log('[GAME START] Counter started');
-
-        // Start tick interval
-        tickIntervalRef.current = setInterval(handleTick, gameState.tickMs!);
-      } else {
-        // Update countdown
-        setGameState((prev) => ({
-          ...prev,
-          countdown: Math.ceil(remaining / 1000), // Convert to seconds
-        }));
-      }
-    }, 100);
-
-    return () => {
-      if (tickIntervalRef.current) {
-        clearInterval(tickIntervalRef.current);
-      }
-      if (countdownIntervalRef.current) {
-        clearInterval(countdownIntervalRef.current);
-      }
-    };
-  }, [gameState.startAt, gameState.tickMs]);
 
   /**
    * Handles starting a new game
@@ -158,11 +153,20 @@ function App() {
     setError(null);
 
     try {
-      console.log('[API] Starting game for user:', userId);
-      const response = await startGame({ userId });
+      // Find best region if auto
+      let region = selectedRegion;
+      if (region === 'auto') {
+        console.log('[REGION] Finding best region...');
+        region = await findBestRegion();
+        console.log(`[REGION] Selected: ${region}`);
+      }
+
+      console.log('[API] Starting game for user:', userId, 'in region:', region);
+      const response = await startGame({ userId, preferredRegion: region });
 
       console.log('[API] Game started:', response);
 
+      // Update game state
       setGameState({
         gameId: response.gameId,
         userId: userId,
@@ -170,9 +174,26 @@ function App() {
         startAt: response.startAt,
         tickMs: response.tickMs,
         counter: 0,
+        step: 0,
+        round: 0,
         isRunning: false,
         countdown: Math.ceil((response.startAt - Date.now()) / 1000),
+        region: response.region,
+        wsEndpoint: response.wsEndpoint,
       });
+
+      // Connect to WebSocket
+      if (response.wsEndpoint) {
+        console.log('[WS] Connecting to:', response.wsEndpoint);
+        wsClientRef.current?.connect(response.wsEndpoint);
+        
+        // Wait for connection then join session
+        setTimeout(() => {
+          wsClientRef.current?.joinSession(response.gameId, userId);
+        }, 500);
+      } else {
+        setError('No WebSocket endpoint available');
+      }
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Failed to start game';
       setError(errorMessage);
@@ -195,22 +216,16 @@ function App() {
 
     try {
       console.log('[API] Exiting game:', gameState.gameId);
+      
+      // Disconnect WebSocket
+      wsClientRef.current?.disconnect();
+
       await exitGame({
         gameId: gameState.gameId,
         userId: gameState.userId,
       });
 
       console.log('[API] Game exited successfully');
-
-      // Clear all timers
-      if (tickIntervalRef.current) {
-        clearInterval(tickIntervalRef.current);
-        tickIntervalRef.current = null;
-      }
-      if (countdownIntervalRef.current) {
-        clearInterval(countdownIntervalRef.current);
-        countdownIntervalRef.current = null;
-      }
 
       // Reset game state
       setGameState({
@@ -220,8 +235,19 @@ function App() {
         startAt: null,
         tickMs: null,
         counter: 0,
+        step: 0,
+        round: 0,
         isRunning: false,
         countdown: null,
+        region: null,
+        wsEndpoint: null,
+      });
+
+      setLatency({
+        avgLatency: 0,
+        jitter: 0,
+        status: 'unknown',
+        samples: [],
       });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : 'Failed to exit game';
@@ -232,10 +258,59 @@ function App() {
     }
   };
 
+  /**
+   * Get latency status color
+   */
+  const getLatencyColor = () => {
+    switch (latency.status) {
+      case 'ok': return '#4caf50';
+      case 'warning': return '#ff9800';
+      case 'critical': return '#f44336';
+      default: return '#9e9e9e';
+    }
+  };
+
+  /**
+   * Get connection status display
+   */
+  const getConnectionStatus = () => {
+    switch (connection.status) {
+      case 'disconnected': return { text: 'Disconnected', color: '#9e9e9e' };
+      case 'connecting': return { text: 'Connecting...', color: '#2196f3' };
+      case 'connected': return { text: 'Connected', color: '#4caf50' };
+      case 'joined': return { text: 'In Game', color: '#4caf50' };
+      case 'kicked': return { text: 'Kicked', color: '#f44336' };
+      case 'error': return { text: 'Error', color: '#f44336' };
+      default: return { text: 'Unknown', color: '#9e9e9e' };
+    }
+  };
+
+  const connStatus = getConnectionStatus();
+
   return (
     <div className="app">
       <div className="container">
-        <h1>Deterministic Game Counter</h1>
+        <h1>🎮 Real-Time Game Counter</h1>
+        <p className="subtitle">Powered by AWS Lambda Tick Broadcaster</p>
+
+        {/* Connection & Latency Status */}
+        <div className="status-bar">
+          <div className="status-item">
+            <span className="status-dot" style={{ backgroundColor: connStatus.color }}></span>
+            <span>{connStatus.text}</span>
+          </div>
+          {gameState.region && (
+            <div className="status-item">
+              <span>📍 {gameState.region}</span>
+            </div>
+          )}
+          {latency.status !== 'unknown' && (
+            <div className="status-item">
+              <span className="status-dot" style={{ backgroundColor: getLatencyColor() }}></span>
+              <span>{latency.avgLatency}ms (±{latency.jitter}ms)</span>
+            </div>
+          )}
+        </div>
 
         {/* User ID Input */}
         <div className="input-group">
@@ -260,6 +335,22 @@ function App() {
           </div>
         </div>
 
+        {/* Region Selection */}
+        <div className="input-group">
+          <label htmlFor="region">Region:</label>
+          <select
+            id="region"
+            value={selectedRegion}
+            onChange={(e) => setSelectedRegion(e.target.value)}
+            disabled={isLoading || gameState.isRunning}
+          >
+            <option value="auto">Auto (Best Latency)</option>
+            <option value="us-east-1">US East (N. Virginia)</option>
+            <option value="eu-west-1">EU (Ireland)</option>
+            <option value="ap-northeast-1">Asia (Tokyo)</option>
+          </select>
+        </div>
+
         {/* Game Controls */}
         <div className="button-group">
           <button
@@ -281,6 +372,23 @@ function App() {
         {/* Error Display */}
         {error && <div className="error">{error}</div>}
 
+        {/* Latency Warning */}
+        {latency.status === 'warning' && (
+          <div className="warning">
+            ⚠️ High latency detected! Your connection may affect gameplay.
+            {latency.message && <p>{latency.message}</p>}
+          </div>
+        )}
+
+        {/* Kicked Message */}
+        {connection.status === 'kicked' && (
+          <div className="error kicked">
+            ❌ You have been disconnected due to poor connection quality.
+            <p>Average latency: {latency.avgLatency}ms (max: {LATENCY_THRESHOLDS.maxLatencyMs}ms)</p>
+            <p>Jitter: {latency.jitter}ms (max: {LATENCY_THRESHOLDS.maxJitterMs}ms)</p>
+          </div>
+        )}
+
         {/* Game Status */}
         {gameState.gameId && (
           <div className="game-status">
@@ -301,6 +409,10 @@ function App() {
               <div className="status-item">
                 <span className="label">Tick Interval:</span>
                 <span className="value">{gameState.tickMs}ms</span>
+              </div>
+              <div className="status-item">
+                <span className="label">Round:</span>
+                <span className="value">{gameState.round}</span>
               </div>
               <div className="status-item">
                 <span className="label">Status:</span>
@@ -325,17 +437,49 @@ function App() {
           <div className="counter">
             <h2>Counter</h2>
             <div className="counter-value">{gameState.counter}</div>
-            <p className="counter-info">
-              Step: {gameState.startAt && gameState.tickMs
-                ? getCurrentStep(gameState.startAt, gameState.tickMs)
-                : 0}
-            </p>
+            <p className="counter-info">Step: {gameState.step}</p>
           </div>
         )}
+
+        {/* Latency Graph */}
+        {latency.samples.length > 0 && (
+          <div className="latency-monitor">
+            <h3>Latency Monitor</h3>
+            <div className="latency-graph">
+              {latency.samples.map((sample, i) => (
+                <div
+                  key={i}
+                  className="latency-bar"
+                  style={{
+                    height: `${Math.min(sample / 2, 100)}%`,
+                    backgroundColor: sample > 150 ? '#f44336' : sample > 100 ? '#ff9800' : '#4caf50',
+                  }}
+                  title={`${sample}ms`}
+                />
+              ))}
+            </div>
+            <div className="latency-stats">
+              <span>Avg: {latency.avgLatency}ms</span>
+              <span>Jitter: ±{latency.jitter}ms</span>
+              <span>Max allowed: {LATENCY_THRESHOLDS.maxLatencyMs}ms</span>
+            </div>
+          </div>
+        )}
+
+        {/* Info */}
+        <div className="info">
+          <h3>How it works</h3>
+          <ul>
+            <li>🌍 Connects to the nearest AWS Lambda (tick-broadcaster)</li>
+            <li>📡 Receives tick updates via WebSocket in real-time</li>
+            <li>⏱️ Measures your latency continuously</li>
+            <li>⚠️ Warns if latency exceeds {LATENCY_THRESHOLDS.warningLatencyMs}ms</li>
+            <li>❌ Disconnects if latency exceeds {LATENCY_THRESHOLDS.maxLatencyMs}ms</li>
+          </ul>
+        </div>
       </div>
     </div>
   );
 }
 
 export default App;
-

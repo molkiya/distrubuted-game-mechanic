@@ -4,23 +4,43 @@
 
 ## Title & Summary
 
-A **multi-region, edge-optimized game backend** that enables synchronized deterministic gameplay across global players using seed-based pseudo-random algorithms. The system consists of a React frontend, a Cloudflare Workers edge gateway for intelligent routing, stateless Go backend services deployed across multiple regions (EU, US, Asia), and Apache Cassandra as the shared distributed storage layer. The core innovation is **client-side deterministic execution**: instead of streaming every game tick from the backend, the system distributes a seed and synchronized start time, allowing clients to independently compute identical game states while reducing backend load by orders of magnitude.
+A **multi-region, edge-optimized game backend** that enables synchronized deterministic gameplay across global players using seed-based pseudo-random algorithms. The system consists of:
+
+- **React Frontend**: Browser-based UI that connects to tick-broadcaster via WebSocket
+- **Cloudflare Workers Edge Gateway**: Intelligent routing to nearest tick-broadcaster region
+- **AWS Lambda Tick Broadcaster**: Multi-region microbackends that broadcast game ticks to players
+- **Go Backend Services**: Stateless services for session management (optional)
+- **DynamoDB/Cassandra**: Distributed storage for sessions and connections
+
+The core innovation is **server-side tick broadcasting via Lambda microbackends**: instead of clients computing ticks locally, geographically distributed Lambda functions compute and broadcast ticks to nearby players via WebSocket, ensuring synchronized gameplay with latency enforcement.
 
 ---
 
 ## High-Level Architecture Overview
 
-The system is designed around four main layers:
+The system is designed around five main layers:
 
-1. **Frontend (React)**: Browser-based UI that calls edge endpoints and runs deterministic game logic locally using seed/startAt/tickMs parameters.
+1. **Frontend (React)**: Browser-based UI that connects to tick-broadcaster WebSocket and receives real-time tick updates.
 
-2. **Edge Gateway (Cloudflare Workers)**: Runs at 300+ global points of presence, routes requests to appropriate backend regions based on geography/user preference, and caches session metadata to reduce backend load.
+2. **Edge Gateway (Cloudflare Workers)**: Routes requests to appropriate tick-broadcaster region based on geography/preference.
 
-3. **Go Backend Services (Multi-Region)**: Stateless HTTP services deployed in EU, US, and Asia regions. Each instance handles session creation/termination and delegates persistence to Cassandra.
+3. **Tick Broadcaster (AWS Lambda)**: Multi-region microbackends that:
+   - Run in 8+ AWS regions worldwide
+   - Compute deterministic game state
+   - Broadcast ticks to connected players via WebSocket
+   - Measure player latency and enforce thresholds
+   - Kick players with poor connections
 
-4. **Cassandra Cluster**: Shared distributed database that stores all game sessions, providing durability, horizontal scalability, and cross-region replication.
+4. **Go Backend Services (Optional)**: Stateless HTTP services for additional session management and analytics.
 
-**Data Flow**: User request → Edge Gateway (routing decision) → Regional Go Backend → Cassandra (persistence) → Response with seed/startAt/tickMs → Frontend (deterministic execution).
+5. **Storage Layer**: DynamoDB for Lambda state, Cassandra for long-term persistence.
+
+**Data Flow**: 
+```
+User → Edge Gateway → Tick Broadcaster (nearest region) → WebSocket → User
+                             ↓
+                         DynamoDB (session/connection state)
+```
 
 ---
 
@@ -30,77 +50,218 @@ The system is designed around four main layers:
 graph TB
     subgraph "Client Layer"
         User[User Browser]
-        React[React Frontend<br/>Deterministic Counter]
+        React[React Frontend<br/>WebSocket Client<br/>Latency Monitor]
     end
     
     subgraph "Edge Layer"
-        Edge[Cloudflare Worker<br/>Edge Gateway<br/>- Region Routing<br/>- Session Cache]
+        Edge[Cloudflare Worker<br/>Edge Gateway<br/>- Region Selection<br/>- Session Cache]
     end
     
-    subgraph "Backend Layer"
-        EU[Go Backend<br/>EU Region<br/>Port 8081]
-        US[Go Backend<br/>US Region<br/>Port 8082]
-        ASIA[Go Backend<br/>Asia Region<br/>Port 8083]
+    subgraph "Tick Broadcaster Layer (AWS Lambda)"
+        US[Lambda us-east-1<br/>Tick Broadcaster<br/>WebSocket API]
+        EU[Lambda eu-west-1<br/>Tick Broadcaster<br/>WebSocket API]
+        ASIA[Lambda ap-northeast-1<br/>Tick Broadcaster<br/>WebSocket API]
     end
     
     subgraph "Storage Layer"
-        Cassandra[(Cassandra Cluster<br/>Distributed Storage<br/>- Sessions<br/>- Cross-region Replication)]
+        DynamoDB[(DynamoDB<br/>- Sessions<br/>- Connections<br/>- Latency Data)]
     end
     
-    User -->|HTTP| React
+    User -->|HTTPS| React
     React -->|POST /edge/game/start| Edge
-    React -->|POST /edge/game/exit| Edge
     
-    Edge -->|Route by Region| EU
-    Edge -->|Route by Region| US
-    Edge -->|Route by Region| ASIA
+    Edge -->|Create Session| US
+    Edge -->|Create Session| EU
+    Edge -->|Create Session| ASIA
     
-    EU -->|Read/Write Sessions| Cassandra
-    US -->|Read/Write Sessions| Cassandra
-    ASIA -->|Read/Write Sessions| Cassandra
+    React <-->|WebSocket| US
+    React <-->|WebSocket| EU
+    React <-->|WebSocket| ASIA
     
-    EU -.->|Response: seed, startAt, tickMs| Edge
-    US -.->|Response: seed, startAt, tickMs| Edge
-    ASIA -.->|Response: seed, startAt, tickMs| Edge
-    
-    Edge -.->|Response: seed, startAt, tickMs, backendRegion| React
+    US -->|Read/Write| DynamoDB
+    EU -->|Read/Write| DynamoDB
+    ASIA -->|Read/Write| DynamoDB
     
     style Edge fill:#e1f5ff
-    style Cassandra fill:#fff4e1
+    style DynamoDB fill:#fff4e1
     style React fill:#e8f5e9
+    style US fill:#ffe0e0
+    style EU fill:#ffe0e0
+    style ASIA fill:#ffe0e0
 ```
 
-### Sequence Diagram: Start Game Flow
+### Sequence Diagram: Start Game with Tick Broadcasting
 
 ```mermaid
 sequenceDiagram
     participant U as User
     participant F as React Frontend
     participant E as Edge Gateway
-    participant B as Go Backend (EU)
-    participant C as Cassandra
+    participant L as Lambda (EU)
+    participant D as DynamoDB
     
     U->>F: Click "Start Game"
     F->>E: POST /edge/game/start<br/>{userId, preferredRegion}
     
-    Note over E: Region Selection:<br/>1. preferredRegion<br/>2. Geo (CF country)<br/>3. Default (eu)
+    Note over E: Select nearest<br/>tick-broadcaster region
     
-    E->>B: POST /game/start<br/>{userId}
+    E->>L: POST /sessions<br/>{userId}
     
-    Note over B: Generate:<br/>- gameId (UUID)<br/>- seed (random)<br/>- startAt (now + 3s)<br/>- tickMs (100)
+    Note over L: Generate:<br/>- sessionId (UUID)<br/>- seed (random)<br/>- startAt (now + 3s)<br/>- tickMs (100)
     
-    B->>C: INSERT session<br/>(gameId, userId, seed, startAt, tickMs, status)
-    C-->>B: OK
+    L->>D: Put session
+    D-->>L: OK
     
-    B-->>E: {gameId, seed, startAt, tickMs}
+    L-->>E: {sessionId, seed, startAt, tickMs, wsEndpoint}
+    E-->>F: {gameId, seed, startAt, tickMs, wsEndpoint, region}
     
-    Note over E: Cache session metadata<br/>(TTL: 30s)
+    F->>L: WebSocket Connect
+    L-->>F: Connected
     
-    E-->>F: {gameId, seed, startAt, tickMs, backendRegion}
+    F->>L: {action: "join", sessionId, userId}
+    L-->>F: {type: "session_joined", ...}
     
-    Note over F: Start countdown to startAt<br/>Then run deterministic counter
+    loop Ping/Pong (every 1s)
+        F->>L: {action: "ping", clientTimestamp}
+        L-->>F: {type: "pong", clientTimestamp, serverTimestamp}
+        Note over F: Calculate RTT<br/>Update latency display
+    end
     
-    F->>F: Deterministic ticks<br/>(no backend calls)
+    Note over L: Countdown...
+    L-->>F: {type: "countdown", remainingMs}
+    
+    loop Game Running (every tickMs)
+        Note over L: Compute state:<br/>StateAt(seed, startAt, tickMs, now)
+        L-->>F: {type: "tick", step, value, round, broken}
+    end
+```
+
+---
+
+## Tick Broadcaster (AWS Lambda) Architecture
+
+### Why Lambda for Tick Broadcasting?
+
+1. **Geographic Distribution**: Deploy to 20+ AWS regions, minimizing latency to players
+2. **Auto-scaling**: Handles spikes in player connections automatically
+3. **Cost-effective**: Pay only for compute time used
+4. **Low Maintenance**: No servers to manage
+
+### Lambda Components
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Tick Broadcaster Lambda                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │                 API Gateway WebSocket API                   │ │
+│  │  - $connect: Player connects                                │ │
+│  │  - $disconnect: Player disconnects                          │ │
+│  │  - join: Join session                                       │ │
+│  │  - ping: Latency measurement                                │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                              │                                   │
+│  ┌───────────────────────────┼───────────────────────────────┐  │
+│  │                           ▼                               │  │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐    │  │
+│  │  │  WebSocket  │  │    HTTP     │  │ Tick Broadcast  │    │  │
+│  │  │  Handlers   │  │  Handlers   │  │    Handler      │    │  │
+│  │  └─────────────┘  └─────────────┘  └─────────────────┘    │  │
+│  │         │                │                │               │  │
+│  │         └────────────────┼────────────────┘               │  │
+│  │                          ▼                                │  │
+│  │  ┌─────────────────────────────────────────────────────┐  │  │
+│  │  │              Deterministic Engine                   │  │  │
+│  │  │  StateAt(seed, startAt, tickMs, now) → State       │  │  │
+│  │  └─────────────────────────────────────────────────────┘  │  │
+│  │                          │                                │  │
+│  │                          ▼                                │  │
+│  │  ┌─────────────────────────────────────────────────────┐  │  │
+│  │  │                    DynamoDB                         │  │  │
+│  │  │  - Sessions table                                   │  │  │
+│  │  │  - Connections table                                │  │  │
+│  │  └─────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Deployed Regions
+
+| Region | Location | Use Case |
+|--------|----------|----------|
+| us-east-1 | N. Virginia | Americas |
+| us-west-2 | Oregon | US West Coast |
+| eu-west-1 | Ireland | Europe |
+| eu-central-1 | Frankfurt | Central Europe |
+| ap-northeast-1 | Tokyo | East Asia |
+| ap-southeast-1 | Singapore | Southeast Asia |
+| ap-south-1 | Mumbai | South Asia |
+| sa-east-1 | São Paulo | South America |
+
+---
+
+## Latency Enforcement System
+
+### Why Latency Thresholds?
+
+Unlike client-side computation, server-broadcasted ticks require low latency for fair gameplay:
+
+- **All players must receive ticks at similar times**
+- **High-latency players would see delayed game state**
+- **Unstable connections cause stuttering and desync**
+
+### Thresholds Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `MAX_LATENCY_MS` | 150ms | Maximum average RTT before kick |
+| `MAX_JITTER_MS` | 50ms | Maximum jitter (std dev) before kick |
+| `WARNING_LATENCY_MS` | 100ms | RTT threshold for warning |
+| `WARNING_JITTER_MS` | 30ms | Jitter threshold for warning |
+| `LATENCY_SAMPLES` | 5 | Samples for rolling average |
+
+### Latency Measurement Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Lambda
+    
+    loop Every 1 second
+        C->>L: {action: "ping", clientTimestamp: T1}
+        L-->>C: {type: "pong", clientTimestamp: T1, serverTimestamp: T2}
+        Note over C: RTT = now - T1<br/>Add to samples
+        Note over C: Calculate avg + jitter
+    end
+    
+    alt RTT > 100ms OR Jitter > 30ms
+        L-->>C: {type: "latency_status", status: "warning"}
+    end
+    
+    alt RTT > 150ms OR Jitter > 50ms
+        L-->>C: {type: "kicked", reason: "..."}
+        L->>C: Close WebSocket
+    end
+```
+
+### Player States
+
+```
+                                    ┌──────────────┐
+                                    │  connecting  │
+                                    └──────┬───────┘
+                                           │
+                                           ▼
+┌──────────────┐    join session    ┌──────────────┐
+│ disconnected │ ◄──────────────────│    ready     │
+└──────────────┘                    └──────┬───────┘
+       ▲                                   │
+       │                                   ▼
+       │         kick (high latency) ┌──────────────┐
+       └─────────────────────────────│   playing    │
+                                     └──────────────┘
 ```
 
 ---
@@ -109,385 +270,237 @@ sequenceDiagram
 
 ### Start Game Flow
 
-1. **User Action**: User enters userId and clicks "Start Game" in React frontend.
+1. **User Action**: User clicks "Start Game" in React frontend.
 
-2. **Frontend → Edge**: Frontend sends `POST /edge/game/start` with:
+2. **Frontend → Edge**: Frontend sends `POST /edge/game/start`:
    ```json
    {
      "userId": "user123",
-     "preferredRegion": "eu"  // optional
+     "preferredRegion": "eu-west-1"
    }
    ```
 
 3. **Edge Gateway Processing**:
-   - **Region Selection**: Determines target backend region using:
-     - Priority 1: `preferredRegion` if provided and valid
-     - Priority 2: `x-user-region` header
-     - Priority 3: Geographic routing (Cloudflare country code → region mapping)
-     - Priority 4: Default region (e.g., "eu")
-   - **Caching Check**: Optionally checks in-memory cache for recent sessions (not applicable for start)
+   - Determines nearest tick-broadcaster region
+   - Priority: preferredRegion → x-user-region header → Geo (CF country) → Default
 
-4. **Edge → Backend**: Edge forwards request to selected regional Go backend:
+4. **Edge → Tick Broadcaster**: Creates session via HTTP:
    ```
-   POST https://eu.api.example.com/game/start
-   { "userId": "user123" }
+   POST https://xxx.execute-api.eu-west-1.amazonaws.com/prod/sessions
    ```
 
-5. **Backend Processing**:
-   - **Generate Game Parameters**:
-     - `gameId`: UUID v4
-     - `seed`: Cryptographically secure random integer
-     - `startAt`: `Date.now() + 3000` (3 seconds in future for countdown)
-     - `tickMs`: 100 (milliseconds between ticks)
-   - **Create Session**: Calls `SessionRepository.CreateSession()` with session data
+5. **Lambda → DynamoDB**: Stores session configuration
 
-6. **Backend → Cassandra**: 
-   ```sql
-   INSERT INTO game_backend.sessions 
-   (session_id, user_id, region, seed, start_at, tick_ms, status, started_at)
-   VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
-   ```
+6. **Response Chain**:
+   - Lambda → Edge: Session details + WebSocket endpoint
+   - Edge → Frontend: Complete response with wsEndpoint
 
-7. **Cassandra → Backend**: Acknowledges write (QUORUM consistency)
+7. **Frontend → Lambda WebSocket**:
+   - Connects to `wss://xxx.execute-api.eu-west-1.amazonaws.com/prod`
+   - Sends join message
+   - Starts receiving tick broadcasts
 
-8. **Backend → Edge**: Returns game parameters:
-   ```json
-   {
-     "gameId": "abc-123-def",
-     "seed": 987654321,
-     "startAt": 1733850000000,
-     "tickMs": 100
-   }
-   ```
+### Tick Broadcast Flow
 
-9. **Edge Caching**: Edge stores session metadata in memory cache:
+The tick broadcaster runs a continuous loop:
+
    ```typescript
-   cache.set({
-     gameId: "abc-123-def",
-     seed: 987654321,
-     startAt: 1733850000000,
-     tickMs: 100,
-     backendRegion: "eu",
-     cachedAt: Date.now()
-   })
-   ```
-
-10. **Edge → Frontend**: Returns response with `backendRegion` added:
-    ```json
-    {
-      "gameId": "abc-123-def",
-      "seed": 987654321,
-      "startAt": 1733850000000,
-      "tickMs": 100,
-      "backendRegion": "eu"
-    }
-    ```
-
-11. **Frontend Execution**:
-    - **Countdown**: Shows countdown until `startAt` timestamp
-    - **Deterministic Counter**: When `Date.now() >= startAt`, starts local counter that:
-      - Calculates `step = floor((now - startAt) / tickMs)`
-      - Uses `deterministicRNG(seed, step)` to decide increments/breaks
-      - Updates UI every `tickMs` milliseconds
-    - **No Backend Calls**: Counter runs entirely client-side
-
-### Exit Game Flow
-
-1. **User Action**: User clicks "Exit Game" in React frontend.
-
-2. **Frontend → Edge**: Sends `POST /edge/game/exit`:
-   ```json
-   {
-     "gameId": "abc-123-def",
-     "userId": "user123",
-     "backendRegion": "eu"  // optional if cached
-   }
-   ```
-
-3. **Edge Gateway Processing**:
-   - **Region Resolution**: 
-     - If `backendRegion` provided → use it
-     - Else → lookup in cache by `gameId`
-     - Else → return 400 error (region required)
-   - **Cache Lookup**: Retrieves cached session to determine backend region if not provided
-
-4. **Edge → Backend**: Forwards to correct regional backend:
-   ```
-   POST https://eu.api.example.com/game/exit
-   { "gameId": "abc-123-def", "userId": "user123" }
-   ```
-
-5. **Backend Processing**:
-   - **Validate Session**: Calls `SessionRepository.GetSession(gameId)`
-   - **Update Status**: Calls `SessionRepository.UpdateSession(gameId, "exited")`
-
-6. **Backend → Cassandra**:
-   ```sql
-   UPDATE game_backend.sessions
-   SET status = 'exited'
-   WHERE session_id = ?
-   IF EXISTS
-   ```
-
-7. **Cassandra → Backend**: Acknowledges update
-
-8. **Backend → Edge**: Returns success:
-   ```json
-   { "ok": true }
-   ```
-
-9. **Edge Cache Cleanup**: Removes session from cache:
-   ```typescript
-   cache.delete(gameId)
-   ```
-
-10. **Edge → Frontend**: Returns success response
-
-11. **Frontend Cleanup**: Stops all timers, clears game state, resets UI
+while (running) {
+  const now = Date.now();
+  
+  for (const session of activeSessions) {
+    // Compute deterministic state
+    const state = stateAt(session.seed, session.startAt, session.tickMs, now);
+    
+    // Get all connections for this session
+    const connections = await getConnectionsBySession(session.sessionId);
+    
+    // Broadcast tick to all players
+    await broadcastToConnections(connections, {
+      type: 'tick',
+      step: state.step,
+      value: state.value,
+      round: state.round,
+      broken: state.broken,
+      serverTimestamp: now,
+    });
+  }
+  
+  // Wait until next tick
+  await sleep(tickMs);
+}
+```
 
 ---
 
-## Seed-based Synchronization Explained
+## Deterministic Engine
 
-### Core Concept
-
-The system achieves **synchronized deterministic behavior** without streaming every game tick from the backend. Instead, the backend acts as a **coordinator** that distributes game parameters, and clients independently compute identical game states using a deterministic algorithm.
-
-### Why This Approach?
-
-1. **Scalability**: Backend doesn't need to handle thousands of tick updates per second per game
-2. **Latency Independence**: Players in different regions see the same pattern despite network latency differences
-3. **Bandwidth Efficiency**: No continuous WebSocket/SSE connections required
-4. **Resilience**: Client can continue running even if backend is temporarily unavailable
-
-### Deterministic Algorithm
-
-The algorithm combines:
-- **Time-based step calculation**: `step = floor((now - startAt) / tickMs)`
-- **Seed-based pseudo-random number generation**: `rngValue = deterministicRNG(seed, step)`
-- **Deterministic decision logic**: `shouldBreak = (rngValue % breakProbability === 0)`
-
-### Pseudo-Code Implementation
+The engine is identical across all Lambda regions, ensuring synchronized state:
 
 ```typescript
-// Step 1: Calculate current step based on elapsed time
-function getCurrentStep(startAt: number, tickMs: number): number {
-  const now = Date.now();
-  const elapsed = now - startAt;
-  return Math.floor(elapsed / tickMs);
-}
-
-// Step 2: Deterministic RNG using Linear Congruential Generator
-function deterministicRNG(seed: number, step: number): number {
-  const a = 1664525;      // multiplier
-  const c = 1013904223;   // increment
-  const m = Math.pow(2, 32); // modulus
+function stateAt(seed: number, startAt: number, tickMs: number, now: number): State {
+  const step = Math.floor((now - startAt) / tickMs);
   
-  const combined = (seed ^ step) >>> 0; // Combine seed and step
-  return Math.abs((a * combined + c) % m);
-}
-
-// Step 3: Determine if counter should break (reset)
-function shouldBreak(seed: number, step: number, breakProbability: number = 50): boolean {
-  const rngValue = deterministicRNG(seed, step);
-  return rngValue % breakProbability === 0;
-}
-
-// Step 4: Game tick logic (runs every tickMs milliseconds)
-function handleTick(gameState: GameState) {
-  const step = getCurrentStep(gameState.startAt, gameState.tickMs);
+  // Simulate from step 0 to current step
+  let value = 0, round = 0, broken = false;
+  let stepsUntilBreak = computeBreakInterval(seed, round);
+  let stepsSinceBreak = 0;
   
-  if (shouldBreak(gameState.seed, step, 50)) {
-    // Reset counter (1 in 50 chance, deterministically)
-    gameState.counter = 0;
-    log(`[BREAK] Step ${step}, Counter reset`);
+  for (let i = 0; i <= step; i++) {
+    broken = false;
+    stepsSinceBreak++;
+    
+    if (stepsSinceBreak >= stepsUntilBreak) {
+      broken = true;
+      round++;
+      value = 0;
+      stepsUntilBreak = computeBreakInterval(seed, round);
+      stepsSinceBreak = 0;
   } else {
-    // Increment counter
-    gameState.counter++;
+      value++;
+    }
   }
+  
+  return { step, value, round, broken };
 }
 ```
 
-### Determinism Guarantee
-
-**Key Property**: Given the same `(seed, startAt, tickMs)` and the same `step` value, all clients produce identical results.
-
-- **Same seed**: All players receive the same seed from backend
-- **Same startAt**: All players start counting from the same timestamp
-- **Same step calculation**: `step = floor((now - startAt) / tickMs)` produces the same value for the same time
-- **Same RNG output**: `deterministicRNG(seed, step)` is a pure function → same inputs = same output
-- **Same decisions**: Break conditions are deterministic → same RNG value = same break decision
-
-### Example Timeline
-
-```
-Time: 0ms     → Backend returns: seed=987654321, startAt=1000, tickMs=100
-Time: 1000ms  → Game starts, step=0,  RNG(987654321, 0)  = 1234567890, counter++
-Time: 1100ms  → step=1,  RNG(987654321, 1)  = 2345678901, counter++
-Time: 1200ms  → step=2,  RNG(987654321, 2)  = 3456789012, counter++
-Time: 1300ms  → step=3,  RNG(987654321, 3)  = 4567890123, counter++
-Time: 5000ms  → step=40, RNG(987654321, 40) = 9876543210, % 50 == 0 → BREAK, counter=0
-```
-
-All players with the same seed see the break at step 40, regardless of their location or latency.
+**Key Properties**:
+- **Deterministic**: Same inputs → Same output
+- **Location-independent**: All Lambda regions compute identical states
+- **Time-synchronized**: All players receive the same tick at the same time (within latency bounds)
 
 ---
 
-## Scalability & Reliability Considerations
+## Scalability & Reliability
 
 ### Horizontal Scalability
 
-**Stateless Go Backends**:
-- Each backend instance is stateless (no in-memory session storage)
-- Can scale horizontally by adding more instances per region
-- Load balancer distributes requests across instances
-- **Why it scales**: No shared state between instances → linear scaling
+**Lambda Auto-scaling**:
+- Scales automatically with player connections
+- Reserved concurrency prevents cold starts for tick broadcaster
+- Each session is independent
 
-**Cassandra Distributed Storage**:
-- **Partitioning**: Sessions distributed across nodes by `session_id` (primary key)
-- **Replication**: Each region can have local replicas + cross-region replication
-- **Write Performance**: Optimized for high write throughput (perfect for session creation)
-- **Read Performance**: Secondary index on `user_id` enables efficient user-based queries
-- **Why it scales**: Add nodes → increase capacity linearly
+**DynamoDB**:
+- On-demand capacity scales with load
+- Global tables for multi-region access
+- TTL automatically cleans up old data
 
-### Reduced Backend Load
+### Latency Reduction
 
-**Client-Side Deterministic Execution**:
-- Backend only handles: session creation, session termination, metadata queries
-- **No real-time tick streaming**: Eliminates thousands of requests per second per game
-- **Example**: 10,000 concurrent games × 10 ticks/second = 100,000 req/s saved
-- **Why it's efficient**: Backend acts as coordinator, not real-time processor
+**Multi-region Deployment**:
+- Lambda in 8+ regions
+- Edge gateway routes to nearest region
+- Players connect to closest tick-broadcaster
 
-### Multi-Region Deployment
+**WebSocket Efficiency**:
+- Persistent connections (no HTTP overhead per tick)
+- Binary message support for efficiency
+- Connection pooling at Lambda
 
-**Latency Reduction**:
-- Edge gateway routes to nearest backend region
-- Regional backends reduce round-trip time
-- **Example**: User in Thailand → Asia backend (50ms) vs EU backend (300ms)
+### Fault Tolerance
 
-**Availability**:
-- If one region fails, edge can route to another region
-- Cassandra replication ensures data availability across regions
-- **Why it's reliable**: No single point of failure
+**Lambda Resilience**:
+- Automatic failover within region
+- Edge can route to alternative region
+- Session state in DynamoDB survives Lambda restarts
 
-### Cassandra Benefits
-
-**High Write Throughput**:
-- Optimized for write-heavy workloads (session creation is write-heavy)
-- No complex joins or transactions → fast writes
-- **Why it fits**: Game sessions are simple key-value writes
-
-**Cross-Region Replication**:
-- Can replicate data across datacenters
-- Provides durability even if entire region fails
-- **Why it's reliable**: Data survives regional outages
-
-**Horizontal Scaling**:
-- Add nodes to increase capacity
-- No downtime required for scaling
-- **Why it scales**: Distributed architecture from ground up
-
-### Edge Layer Benefits
-
-**Proximity to Users**:
-- Cloudflare Workers run at 300+ global locations
-- Sub-10ms response times at edge
-- **Why it's fast**: Code runs close to users
-
-**Intelligent Routing**:
-- Edge can route based on geography, latency, or load
-- Reduces backend load by caching frequently accessed data
-- **Why it's efficient**: Reduces unnecessary backend calls
-
-**Future Microprocess Hosting**:
-- Edge can host lightweight game state (Durable Objects)
-- Real-time coordination without hitting backend
-- **Why it's extensible**: Foundation for more complex games
+**Connection Recovery**:
+- Client reconnects automatically
+- Session state persisted in DynamoDB
+- Graceful degradation with latency warnings
 
 ---
 
-## Possible Extensions
+## Comparison: Client-Side vs Server-Side Ticks
 
-### 1. Redis Cache Layer
+| Aspect | Client-Side (Old) | Server-Side (New) |
+|--------|-------------------|-------------------|
+| **Tick Computation** | Each client computes locally | Lambda computes and broadcasts |
+| **Synchronization** | All clients sync by time | All clients receive same tick |
+| **Latency Independence** | Yes (no network for ticks) | No (requires low latency) |
+| **Fair Play** | Depends on client honesty | Enforced by server |
+| **Cheating Resistance** | Low (client-side logic) | High (server-authoritative) |
+| **Connection Required** | Only at start/end | Throughout gameplay |
+| **Backend Load** | Minimal | Moderate (WebSocket + broadcasts) |
 
-**Purpose**: Reduce Cassandra read load for hot sessions
+### When to Use Which
 
-**Implementation**:
-- Add Redis cluster between Go backends and Cassandra
-- Cache frequently accessed sessions (TTL: 5 minutes)
-- Write-through cache: write to both Redis and Cassandra
+**Client-Side Ticks**:
+- Single-player games
+- High-latency environments
+- Cost-sensitive deployments
 
-**Benefits**:
-- Faster session lookups (sub-millisecond vs 10-50ms for Cassandra)
-- Reduces Cassandra query load
-- Can serve as session store for edge gateway
+**Server-Side Ticks (Lambda)**:
+- Multiplayer games requiring sync
+- Competitive games needing fair play
+- Games requiring server-authoritative state
 
-### 2. Event Streaming (Kafka/NATS)
+---
 
-**Purpose**: Real-time analytics and event processing
+## Deployment
 
-**Implementation**:
-- Backend publishes events: `game.started`, `game.exited`, `game.break`
-- Kafka/NATS streams events to analytics pipeline
-- Real-time dashboards, leaderboards, fraud detection
+### Prerequisites
 
-**Benefits**:
-- Decouples analytics from core game logic
-- Enables real-time features without impacting game performance
-- Historical event replay for debugging
+- AWS CLI configured
+- Node.js 18+
+- Serverless Framework 3.x
+- Cloudflare Workers (wrangler)
 
-### 3. Edge-Based Game Rooms (Durable Objects)
+### Deploy Tick Broadcaster
 
-**Purpose**: Host lightweight game state at edge for multiplayer coordination
+```bash
+cd tick-broadcaster
+npm install
+npm run build
+npm run deploy:all  # Deploy to all regions
+```
 
-**Implementation**:
-- Use Cloudflare Durable Objects for stateful game rooms
-- Edge coordinates real-time updates between players
-- Backend only handles persistence and heavy computation
+### Deploy Edge Gateway
 
-**Benefits**:
-- Sub-10ms coordination latency
-- Reduces backend load for real-time features
-- Enables new game types (multiplayer, tournaments)
+```bash
+cd edge
+npm install
+npm run deploy
+```
 
-### 4. Advanced Region Selection
+### Deploy Frontend
 
-**Purpose**: Optimize routing based on latency, load, or cost
+```bash
+cd frontend
+npm install
+npm run build
+# Deploy to hosting (Vercel, Netlify, S3, etc.)
+```
 
-**Implementation**:
-- Latency-based: Measure RTT to each region, route to fastest
-- Load-based: Query backend health endpoints, route to least loaded
-- Hybrid: Combine latency + load + cost metrics
+### Environment Variables
 
-**Benefits**:
-- Better user experience (lower latency)
-- Better resource utilization (load balancing)
-- Cost optimization (route to cheaper regions)
+**Tick Broadcaster**:
+```yaml
+MAX_LATENCY_MS: 150
+MAX_JITTER_MS: 50
+WARNING_LATENCY_MS: 100
+WARNING_JITTER_MS: 30
+DEFAULT_TICK_MS: 100
+COUNTDOWN_MS: 3000
+```
 
-### 5. Session Migration
+**Edge Gateway**:
+```yaml
+TICK_US_HTTP: https://xxx.execute-api.us-east-1.amazonaws.com/prod
+TICK_US_WS: wss://xxx.execute-api.us-east-1.amazonaws.com/prod
+TICK_EU_HTTP: https://xxx.execute-api.eu-west-1.amazonaws.com/prod
+TICK_EU_WS: wss://xxx.execute-api.eu-west-1.amazonaws.com/prod
+USE_TICK_BROADCASTER: true
+```
 
-**Purpose**: Move active sessions between regions for load balancing
+---
 
-**Implementation**:
-- Backend detects overloaded region
-- Migrates session metadata to another region
-- Edge updates routing for migrated sessions
+## Future Enhancements
 
-**Benefits**:
-- Dynamic load balancing
-- Handles traffic spikes gracefully
-- Better resource utilization
-
-### 6. Deterministic Replay System
-
-**Purpose**: Debug and analyze game behavior
-
-**Implementation**:
-- Store all game parameters (seed, startAt, tickMs) in Cassandra
-- Replay algorithm: Re-run deterministic logic with stored parameters
-- Compare replay results with actual game logs
-
-**Benefits**:
-- Debug synchronization issues
-- Analyze game patterns
-- Validate determinism correctness
+1. **Provisioned Concurrency**: Eliminate Lambda cold starts
+2. **Global DynamoDB Tables**: Cross-region session migration
+3. **Adaptive Tick Rate**: Adjust tick rate based on player latency
+4. **Player Grouping**: Group players by latency for fairer matches
+5. **Analytics Pipeline**: Stream events to Kinesis for real-time analytics
+6. **Replay System**: Record and replay games from stored ticks

@@ -1,0 +1,171 @@
+service: tick-broadcaster
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'eu-west-1'}
+  memorySize: 256
+  timeout: 30
+  
+  environment:
+    CONNECTIONS_TABLE: ${self:service}-connections-${self:provider.stage}
+    SESSIONS_TABLE: ${self:service}-sessions-${self:provider.stage}
+    REGION: ${self:provider.region}
+    # Latency thresholds (milliseconds)
+    MAX_LATENCY_MS: 150
+    MAX_JITTER_MS: 50
+    LATENCY_SAMPLES: 5
+    # Tick configuration
+    DEFAULT_TICK_MS: 100
+    # Connection cleanup
+    CONNECTION_TTL_SECONDS: 3600
+  
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+            - dynamodb:Scan
+          Resource:
+            - !GetAtt ConnectionsTable.Arn
+            - !GetAtt SessionsTable.Arn
+            - !Join ['/', [!GetAtt ConnectionsTable.Arn, 'index/*']]
+            - !Join ['/', [!GetAtt SessionsTable.Arn, 'index/*']]
+        - Effect: Allow
+          Action:
+            - execute-api:ManageConnections
+          Resource:
+            - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*/@connections/*'
+
+functions:
+  # WebSocket handlers
+  connect:
+    handler: dist/handlers/websocket.handleConnect
+    events:
+      - websocket:
+          route: $connect
+
+  disconnect:
+    handler: dist/handlers/websocket.handleDisconnect
+    events:
+      - websocket:
+          route: $disconnect
+
+  default:
+    handler: dist/handlers/websocket.handleDefault
+    events:
+      - websocket:
+          route: $default
+
+  # Game actions
+  joinSession:
+    handler: dist/handlers/websocket.handleJoinSession
+    events:
+      - websocket:
+          route: join
+
+  ping:
+    handler: dist/handlers/websocket.handlePing
+    events:
+      - websocket:
+          route: ping
+
+  # HTTP endpoints for session management
+  createSession:
+    handler: dist/handlers/http.handleCreateSession
+    events:
+      - http:
+          path: /sessions
+          method: post
+          cors: true
+
+  getSession:
+    handler: dist/handlers/http.handleGetSession
+    events:
+      - http:
+          path: /sessions/{sessionId}
+          method: get
+          cors: true
+
+  # Tick broadcaster (runs periodically or triggered)
+  tickBroadcaster:
+    handler: dist/handlers/tick.handleTickBroadcast
+    events:
+      # Trigger every 100ms via CloudWatch Events (minimum is 1 minute)
+      # For sub-second ticks, use Step Functions or internal loop
+      - schedule:
+          rate: rate(1 minute)
+          enabled: false # We use internal loop instead
+    # Reserved concurrency to ensure consistent performance
+    reservedConcurrency: 10
+
+  # Latency monitor
+  latencyMonitor:
+    handler: dist/handlers/latency.handleLatencyMonitor
+    events:
+      - schedule:
+          rate: rate(1 minute)
+
+resources:
+  Resources:
+    ConnectionsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.CONNECTIONS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: connectionId
+            AttributeType: S
+          - AttributeName: sessionId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: connectionId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: sessionId-index
+            KeySchema:
+              - AttributeName: sessionId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    SessionsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.SESSIONS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: sessionId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: sessionId
+            KeyType: HASH
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+  Outputs:
+    WebSocketApiUrl:
+      Description: WebSocket API URL
+      Value: !Sub 'wss://${WebsocketsApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}'
+    HttpApiUrl:
+      Description: HTTP API URL
+      Value: !Sub 'https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}'
+    Region:
+      Description: Deployed region
+      Value: ${self:provider.region}
+
+plugins:
+  - serverless-offline
+
